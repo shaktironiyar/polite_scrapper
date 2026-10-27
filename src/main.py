@@ -1,4 +1,5 @@
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin
 
@@ -87,11 +88,67 @@ def dedupe(found: list[dict]) -> list[dict]:
         unique.setdefault(item["product_url"], item)
     return list(unique.values())
 
+def cache_name_for_book(url: str) -> str:
+    slug = url.rstrip("/").split("/")[-2]   # e.g. a-light-in-the-attic_1000
+    return f"book-{slug}.html"
+
+
+def fetched_at(cache_name: str) -> str:
+    """When the cached file was written, as UTC ISO-8601."""
+    mtime = (CACHE_DIR / cache_name).stat().st_mtime
+    return datetime.fromtimestamp(mtime, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_book(html: str, product_url: str, source_page: str, fetched: str) -> dict:
+    """Extract the 8 raw fields from one book detail page."""
+    soup = BeautifulSoup(html, "html.parser")
+    product = soup.select_one("article.product_page")
+    main = product.select_one("div.product_main")
+
+    title = main.select_one("h1").get_text(strip=True)
+    price_text = main.select_one("p.price_color").get_text(strip=True)
+    availability_text = " ".join(main.select_one("p.availability").get_text().split())
+
+    rating_el = main.select_one("p.star-rating")
+    rating_text = next((c for c in rating_el["class"] if c != "star-rating"), None)
+
+    desc_el = product.select_one("#product_description + p")
+    description = (desc_el.get_text(strip=True) or None) if desc_el else None
+
+    return {
+        "title": title,
+        "product_url": product_url,
+        "price_text": price_text,
+        "availability_text": availability_text,
+        "rating_text": rating_text,
+        "description": description,
+        "source_page": source_page,
+        "fetched_at": fetched,
+    }
+
+
+def extract_details(items: list[dict]) -> list[dict]:
+    records = []
+    for item in items:
+        url = item["product_url"]
+        name = cache_name_for_book(url)
+        html = fetch(url, name)
+        if html is None:
+            continue  # Stage 5 will log and count this properly
+        records.append(parse_book(html, url, item["source_page"], fetched_at(name)))
+    return records
+
 
 if __name__ == "__main__":
+    import json
+
     found, pages = discover_books()
     unique = dedupe(found)
     print(f"catalogue_pages={pages}, discovered={len(found)}, unique_urls={len(unique)}")
+
+    records = extract_details(unique)
+    print(json.dumps(records[0], indent=2, ensure_ascii=False))
+    print(f"detail_pages={len(records)}")
 
     
 
