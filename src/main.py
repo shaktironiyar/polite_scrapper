@@ -2,6 +2,10 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin
+import json
+import re
+
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 import requests
 from bs4 import BeautifulSoup
@@ -12,6 +16,7 @@ USER_AGENT = "FlyRankInternshipA9/1.0 (+https://github.com/YOUR_USER/YOUR_REPO)"
 TIMEOUT = 10        # seconds
 MIN_DELAY = 0.5     # seconds between REAL requests
 MAX_PAGES = 3
+OUTPUT_DIR = Path("output")
 
 _last_request_at = 0.0
 
@@ -138,17 +143,69 @@ def extract_details(items: list[dict]) -> list[dict]:
         records.append(parse_book(html, url, item["source_page"], fetched_at(name)))
     return records
 
+class Book(BaseModel):
+    title: str = Field(min_length=1)
+    product_url: str
+    price_text: str
+    price_gbp: float = Field(ge=0)
+    availability_text: str
+    rating_text: str
+    description: str | None = None
+    source_page: str
+    fetched_at: str
+
+    @field_validator("product_url", "source_page")
+    @classmethod
+    def must_be_https(cls, v: str) -> str:
+        if not v.startswith("https://"):
+            raise ValueError("must start with https://")
+        return v
+
+
+def parse_price(text: str) -> float | None:
+    match = re.search(r"\d+(?:\.\d+)?", text.replace(",", ""))
+    return float(match.group()) if match else None
+
+
+def normalize(raw: dict) -> dict:
+    """Keep the raw fields and add the clean price next to them."""
+    return {**raw, "price_gbp": parse_price(raw["price_text"])}
+
+
+def validate_records(raws: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Return (valid unique records, errors). Identity is product_url."""
+    good: dict[str, dict] = {}
+    errors: list[dict] = []
+    for raw in raws:
+        try:
+            book = Book(**normalize(raw))
+        except (ValidationError, KeyError, TypeError) as e:
+            errors.append({
+                "product_url": raw.get("product_url"),
+                "reason": str(e),
+                "raw": raw,
+            })
+            continue
+        good[book.product_url] = book.model_dump()
+    return list(good.values()), errors
+
+
+def write_json(path: Path, data) -> None:
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
 
 if __name__ == "__main__":
-    import json
-
     found, pages = discover_books()
     unique = dedupe(found)
     print(f"catalogue_pages={pages}, discovered={len(found)}, unique_urls={len(unique)}")
 
-    records = extract_details(unique)
-    print(json.dumps(records[0], indent=2, ensure_ascii=False))
-    print(f"detail_pages={len(records)}")
+    raws = extract_details(unique)
+    print(f"detail_pages={len(raws)}")
 
+    books, errors = validate_records(raws)
+    write_json(OUTPUT_DIR / "books.json", books)
+    write_json(OUTPUT_DIR / "errors.json", errors)
+    print(f"valid={len(books)}, invalid={len(errors)}")
     
 
