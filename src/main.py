@@ -4,6 +4,7 @@ from pathlib import Path
 from urllib.parse import urljoin
 import json
 import re
+import sys
 
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
@@ -17,41 +18,61 @@ TIMEOUT = 10        # seconds
 MIN_DELAY = 0.5     # seconds between REAL requests
 MAX_PAGES = 3
 OUTPUT_DIR = Path("output")
+RETRY_WAIT = 2  # seconds before the single retry
+
+STATS = {"pages_fetched": 0, "cache_hits": 0, "failed_pages": 0, "failed_urls": []}
 
 _last_request_at = 0.0
 
 
+def _fail(url: str, why: str) -> None:
+    STATS["failed_pages"] += 1
+    STATS["failed_urls"].append(url)
+    print(f"FAILED     {url}  {why}")
+    return None
+
+
 def fetch(url: str, cache_name: str) -> str | None:
-    """HTML from cache if present, else from the site (politely). None on failure."""
+    """HTML from cache, else from the site (polite, one retry). None on failure."""
     global _last_request_at
     CACHE_DIR.mkdir(exist_ok=True)
     path = CACHE_DIR / cache_name
 
     if path.exists():
         html = path.read_text(encoding="utf-8")
+        STATS["cache_hits"] += 1
         print(f"CACHE HIT  {cache_name}  {len(html)} chars")
         return html
 
-    # polite delay: only real requests count
-    wait = MIN_DELAY - (time.monotonic() - _last_request_at)
-    if wait > 0:
-        time.sleep(wait)
+    for attempt in (1, 2):
+        wait = MIN_DELAY - (time.monotonic() - _last_request_at)
+        if wait > 0:
+            time.sleep(wait)
 
-    try:
-        _last_request_at = time.monotonic()
-        resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
-    except requests.RequestException as e:
-        print(f"FAILED     {url}  {e}")
-        return None
+        try:
+            _last_request_at = time.monotonic()
+            resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
+        except requests.RequestException as e:
+            retryable = isinstance(e, (requests.Timeout, requests.ConnectionError))
+            if retryable and attempt == 1:
+                print(f"RETRY      {url}  {type(e).__name__}")
+                time.sleep(RETRY_WAIT)
+                continue
+            return _fail(url, type(e).__name__)
 
-    if resp.status_code != 200:
-        print(f"FAILED     {url}  status={resp.status_code}")
-        return None
+        if resp.status_code == 200:
+            resp.encoding = "utf-8"
+            path.write_text(resp.text, encoding="utf-8")
+            STATS["pages_fetched"] += 1
+            print(f"FETCH      {cache_name}  {len(resp.text)} chars")
+            return resp.text
 
-    resp.encoding = "utf-8"
-    path.write_text(resp.text, encoding="utf-8")
-    print(f"FETCH      {cache_name}  {len(resp.text)} chars")
-    return resp.text
+        if resp.status_code >= 500 and attempt == 1:
+            print(f"RETRY      {url}  status={resp.status_code}")
+            time.sleep(RETRY_WAIT)
+            continue
+
+        return _fail(url, f"status={resp.status_code}")  # 404, 403, etc.: no retry
 
 
 def parse_catalogue(html: str, page_url: str) -> tuple[list[str], str | None]:
@@ -131,7 +152,6 @@ def parse_book(html: str, product_url: str, source_page: str, fetched: str) -> d
         "fetched_at": fetched,
     }
 
-
 def extract_details(items: list[dict]) -> list[dict]:
     records = []
     for item in items:
@@ -139,8 +159,11 @@ def extract_details(items: list[dict]) -> list[dict]:
         name = cache_name_for_book(url)
         html = fetch(url, name)
         if html is None:
-            continue  # Stage 5 will log and count this properly
-        records.append(parse_book(html, url, item["source_page"], fetched_at(name)))
+            continue  # already counted as failed by fetch()
+        try:
+            records.append(parse_book(html, url, item["source_page"], fetched_at(name)))
+        except Exception as e:
+            _fail(url, f"parse error: {type(e).__name__}: {e}")
     return records
 
 class Book(BaseModel):
@@ -195,9 +218,20 @@ def write_json(path: Path, data) -> None:
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-if __name__ == "__main__":
+
+def main() -> None:
+    started = datetime.now(timezone.utc)
+    t0 = time.monotonic()
+
     found, pages = discover_books()
     unique = dedupe(found)
+
+    if "--with-fake" in sys.argv:  # failure test: one made-up URL
+        unique.append({
+            "product_url": "https://books.toscrape.com/catalogue/this-book-does-not-exist_999/index.html",
+            "source_page": START_URL,
+        })
+
     print(f"catalogue_pages={pages}, discovered={len(found)}, unique_urls={len(unique)}")
 
     raws = extract_details(unique)
@@ -207,5 +241,22 @@ if __name__ == "__main__":
     write_json(OUTPUT_DIR / "books.json", books)
     write_json(OUTPUT_DIR / "errors.json", errors)
     print(f"valid={len(books)}, invalid={len(errors)}")
+
+    report = {
+        "started_at": started.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "duration_seconds": round(time.monotonic() - t0, 2),
+        "pages_fetched": STATS["pages_fetched"],
+        "cache_hits": STATS["cache_hits"],
+        "valid_records": len(books),
+        "invalid_records": len(errors),
+        "failed_pages": STATS["failed_pages"],
+        "failed_urls": STATS["failed_urls"],
+    }
+    write_json(OUTPUT_DIR / "run-report.json", report)
+    print(json.dumps(report, indent=2))
+
+
+if __name__ == "__main__":
+    main()
     
 
